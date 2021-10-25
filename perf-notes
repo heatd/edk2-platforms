@@ -1,0 +1,5 @@
+pre-dentry-open:
+IO:  1.4MB read 717 reads
+bootx64.efi open: ~30ms
+initrd.tar open: ~11ms
+post-dentry-open:

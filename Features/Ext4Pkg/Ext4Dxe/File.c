@@ -8,6 +8,7 @@
 #include "Ext4Dxe.h"
 
 #include <Library/BaseUcs2Utf8Lib.h>
+#include <Library/TimerLib.h>
 
 /**
    Duplicates a file structure.
@@ -118,19 +119,20 @@ Ext4ApplyPermissions (
 /**
    Detects if we have permissions to search on the directory.
 
-   @param[in out] File         Pointer to the open directory.
+   @param[in out] Dentry         Pointer to the open directory.
 
    @return           True if we have permission to search, else false.
 **/
 STATIC
 BOOLEAN
 Ext4DirCanLookup (
-  IN CONST EXT4_FILE  *File
+  IN CONST EXT4_DENTRY  *Dentry
   )
 {
   // In UNIX, executable permission on directories means that we have permission to look up
   // files in a directory.
-  return (File->Inode->i_mode & EXT4_INO_PERM_EXEC_OWNER) == EXT4_INO_PERM_EXEC_OWNER;
+  return TRUE;
+  //return (File->Inode->i_mode & EXT4_INO_PERM_EXEC_OWNER) == EXT4_INO_PERM_EXEC_OWNER;
 }
 
 /**
@@ -173,23 +175,28 @@ Ext4Open (
   IN UINT64              Attributes
   )
 {
-  EXT4_FILE       *Current;
+  EXT4_DENTRY     *Current;
   EXT4_PARTITION  *Partition;
   UINTN           Level;
   CHAR16          PathSegment[EXT4_NAME_MAX + 1];
   UINTN           Length;
   EXT4_FILE       *File;
   EFI_STATUS      Status;
+  UINT64          T0;
+  UINT64          T1;
 
-  Current   = (EXT4_FILE *)This;
-  Partition = Current->Partition;
+  T0 = GetPerformanceCounter ();
+
+  File      = (EXT4_FILE *)This;
+  Current   = File->Dentry;
+  Partition = File->Partition;
   Level     = 0;
 
   DEBUG ((DEBUG_FS, "[ext4] Ext4Open %s\n", FileName));
   // If the path starts with a backslash, we treat the root directory as the base directory
   if (FileName[0] == L'\\') {
     FileName++;
-    Current = Partition->Root;
+    Current = Partition->Root->Dentry;
   }
 
   while (FileName[0] != L'\0') {
@@ -216,7 +223,7 @@ Ext4Open (
 
     DEBUG ((DEBUG_FS, "[ext4] Opening %s\n", PathSegment));
 
-    if (!Ext4FileIsDir (Current)) {
+    if (!Ext4DentryIsDir (Current)) {
       return EFI_INVALID_PARAMETER;
     }
 
@@ -273,8 +280,11 @@ Ext4Open (
   }
 
   *NewHandle = &Current->Protocol;
+  T1 = GetPerformanceCounter ();
 
   DEBUG ((DEBUG_FS, "[ext4] Opened filename %s\n", Current->Dentry->Name));
+
+  DEBUG ((DEBUG_INFO, "[ext4] Open of %s took %lu ms\n", FileName, GetTimeInNanoSecond (T1 - T0) / 1000000));
   return EFI_SUCCESS;
 }
 

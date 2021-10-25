@@ -402,7 +402,7 @@ Ext4RetrieveDirent (
 **/
 EFI_STATUS
 Ext4OpenFile (
-  IN  EXT4_FILE       *Directory,
+  IN  EXT4_DENTRY       *Directory,
   IN  CONST CHAR16    *Name,
   IN  EXT4_PARTITION  *Partition,
   IN  UINT64          OpenMode,
@@ -758,6 +758,17 @@ Ext4FileIsDir (
 BOOLEAN
 Ext4FileIsReg (
   IN CONST EXT4_FILE  *File
+  );
+
+/**
+   Checks if a dentry is a directory.
+   @param[in]      Dentry          Pointer to the dentry.
+
+   @return TRUE if dentry is a directory.
+**/
+BOOLEAN
+Ext4DentryIsDir (
+  IN CONST EXT4_DENTRY  *Dentry
   );
 
 // In EFI we can't open FIFO pipes, UNIX sockets, character/block devices since these concepts are

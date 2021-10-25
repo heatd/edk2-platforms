@@ -308,6 +308,126 @@ Error:
 }
 
 /**
+   Opens a file from disk and adds it to the dentry cache.
+
+   @param[in]      Directory   Pointer to the opened directory.
+   @param[in]      Name        Pointer to the UCS-2 formatted filename.
+   @param[in]      Partition   Pointer to the ext4 partition.
+   @param[in]      OpenMode    Mode in which the file is supposed to be open.
+   @param[out]     OutFile     Pointer to the newly opened file.
+
+   @return Result of the operation.
+**/
+EFI_STATUS
+Ext4OpenFileFromDisk (
+  IN  EXT4_DENTRY     *Directory,
+  IN  CONST CHAR16    *Name,
+  IN  EXT4_PARTITION  *Partition,
+  IN  UINT64          OpenMode,
+  OUT EXT4_FILE       **OutFile
+  )
+{
+  EXT4_DIR_ENTRY  Entry;
+  EFI_STATUS      Status;
+  EXT4_FILE       FakeFile;
+
+  Status = Ext4RetrieveDirent (Directory, Name, Partition, &Entry);
+
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  return Ext4OpenDirent (Partition, OpenMode, OutFile, &Entry, Directory);
+}
+
+/**
+   Fetches a dentry from the children of a given dentry.
+
+   @param[in]      Directory   Pointer to the opened directory.
+   @param[in]      Name        Pointer to the UCS-2 formatted filename.
+   @param[out]     OutDentry     Pointer to the newly opened dentry.
+
+   @return Result of the operation.
+**/
+STATIC
+EFI_STATUS
+Ext4OpenDentryInternal (
+  IN  EXT4_DENTRY   *Directory,
+  IN  CONST CHAR16  *Name,
+  OUT EXT4_DENTRY   **OutDentry
+  )
+{
+  EXT4_DENTRY  *Ret;
+  LIST_ENTRY   *Entry;
+  EXT4_DENTRY  *D;
+
+  Ret = NULL;
+
+  if (StrCmp (Name, L".") == 0) {
+    Ret = Directory;
+    goto Out;
+  }
+
+  if (StrCmp (Name, L"..") == 0) {
+    // UEFI requires us to error out on ".." for root directories.
+    if (Directory->Parent == NULL) {
+      return EFI_NOT_FOUND;
+    }
+
+    Ret = Directory->Parent;
+    goto Out;
+  }
+
+  // Go through the list and try to find the dentry
+  BASE_LIST_FOR_EACH (Entry, &Directory->Children) {
+    D = EXT4_DENTRY_FROM_DENTRY_LIST (Entry);
+
+    if (StrCmp(Directory->Name, Name) == 0) {
+      Ret = D;
+      goto Out;
+    }
+  }
+
+  return EFI_NO_MAPPING;
+Out:
+  Ext4RefDentry (Ret);
+  *OutDentry = Ret;
+  return EFI_SUCCESS;
+}
+
+/**
+   Opens a file from the dentry cache.
+
+   @param[in]      Directory   Pointer to the opened directory.
+   @param[in]      Name        Pointer to the UCS-2 formatted filename.
+   @param[in]      Partition   Pointer to the ext4 partition.
+   @param[in]      OpenMode    Mode in which the file is supposed to be open.
+   @param[out]     OutFile     Pointer to the newly opened file.
+
+   @return Result of the operation.
+**/
+STATIC
+EFI_STATUS
+Ext4OpenFromDentryCache (
+  IN  EXT4_DENTRY     *Directory,
+  IN  CONST CHAR16    *Name,
+  IN  EXT4_PARTITION  *Partition,
+  IN  UINT64          OpenMode,
+  OUT EXT4_FILE       **OutFile
+  )
+{
+  EXT4_DENTRY  *Dentry;
+  EFI_STATUS   Status;
+
+  Status = Ext4OpenDentryInternal (Directory, Name, &Dentry);
+
+  if (Status == EFI_NOT_FOUND) {
+    // We hit the ".." on root path
+    return Status;
+  }
+}
+
+/**
    Opens a file.
 
    @param[in]      Directory   Pointer to the opened directory.
@@ -320,28 +440,23 @@ Error:
 **/
 EFI_STATUS
 Ext4OpenFile (
-  IN  EXT4_FILE       *Directory,
+  IN  EXT4_DENTRY     *Directory,
   IN  CONST CHAR16    *Name,
   IN  EXT4_PARTITION  *Partition,
   IN  UINT64          OpenMode,
   OUT EXT4_FILE       **OutFile
   )
 {
-  EXT4_DIR_ENTRY  Entry;
-  EFI_STATUS      Status;
+  EFI_STATUS  Status;
 
-  Status = Ext4RetrieveDirent (Directory, Name, Partition, &Entry);
+  Status = Ext4OpenFromDentryCache (Directory, Name, Partition, OpenMode, OutFile);
 
-  if (EFI_ERROR (Status)) {
+  if (!EFI_ERROR (Status) || Status != EFI_NOT_FOUND) {
+    // Errors that do not mean it was not found in the cache error out as well.
     return Status;
   }
 
-  // EFI requires us to error out on ".." opens for the root directory
-  if (Entry.inode == Directory->InodeNum) {
-    return EFI_NOT_FOUND;
-  }
-
-  return Ext4OpenDirent (Partition, OpenMode, OutFile, &Entry, Directory);
+  return Ext4OpenFileFromDisk (Directory, Name, Partition, OpenMode, OutFile)
 }
 
 /**
@@ -688,4 +803,18 @@ Ext4UnrefDentry (
   }
 
   return FALSE;
+}
+
+/**
+   Checks if a dentry is a directory.
+   @param[in]      Dentry          Pointer to the dentry.
+
+   @return TRUE if dentry is a directory.
+**/
+BOOLEAN
+Ext4DentryIsDir (
+  IN CONST EXT4_DENTRY  *Dentry
+  )
+{
+  return TRUE;
 }
