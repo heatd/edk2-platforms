@@ -288,6 +288,18 @@ Ext4GetBlockGroupDesc (
   );
 
 /**
+   Checks inode number validity across superblock of the opened partition.
+   Currently we don't have logic to process defective blocks with
+   inode number equal 1, so we don't reject them at this point
+
+   @param[in]  Partition      Pointer to the opened ext4 partition.
+
+   @return TRUE if inode number is valid.
+**/
+#define EXT4_IS_VALID_INODE_NR(Partition, InodeNum)                            \
+  (((InodeNum) > 0) && (InodeNum) <= (Partition->SuperBlock.s_inodes_count))
+
+/**
    Reads an inode from disk.
 
    @param[in]    Partition  Pointer to the opened partition.
