@@ -437,6 +437,94 @@ Ext4OpenVolume (
 }
 
 /**
+   Check if we should skip an entry on ReadDir.
+
+   @param[in]      Entry   Pointer to the ext4 dirent.
+
+   @return True if we should skip it (see implementation), else False
+**/
+STATIC
+BOOLEAN
+Ext4ShouldSkipOnReadDir (
+  IN CONST EXT4_DIR_ENTRY  *Entry
+  )
+{
+  BOOLEAN  IsDotOrDotDot;
+
+  // We don't care about passing . or .. entries to the caller of ReadDir(),
+  // since they're generally useless entries *and* may break things if too
+  // many callers assume FAT32.
+
+  // Entry.name_len may be 0 if it's a nameless entry, like an unused entry
+  // or a checksum at the end of the directory block.
+  // memcmp (and CompareMem) return 0 when the passed length is 0.
+
+  // We must bound name_len as > 0 and <= 2 to avoid any out-of-bounds accesses or bad detection of
+  // "." and "..".
+  IsDotOrDotDot = Entry->name_len > 0 && Entry->name_len <= 2 &&
+                  CompareMem (Entry->name, "..", Entry->name_len) == 0;
+
+  // When inode = 0, it's unused. When name_len == 0, it's a nameless entry
+  // (which we should not expose to ReadDir).
+  return Entry->inode == 0 || Entry->name_len == 0 || IsDotOrDotDot;
+}
+
+/**
+   'Stat' a directory entry, filling out a EFI_FILE_INFO.
+
+   @param[in]      Partition   Pointer to the ext4 partition.
+   @param[in]      Entry       Pointer to the directory entry.
+   @param[in]      Directory   Pointer to the open directory.
+   @param[out]     Buffer      Pointer to the output buffer.
+   @param[in out] OutLength    Pointer to a UINTN that contains the length of the buffer,
+                               and the length of the actual EFI_FILE_INFO after the call.
+   @param[out]    SkipDirent   Pointer to a BOOLEAN that gets set to true if we should skip
+                               the dirent (because UTF-8 -> UCS2 conversion failed, for instance).
+
+   @return Result of the operation.
+**/
+STATIC
+EFI_STATUS
+Ext4StatDirent (
+  IN EXT4_PARTITION  *Partition,
+  IN EXT4_DIR_ENTRY  *Entry,
+  IN EXT4_FILE       *Directory,
+  OUT VOID           *Buffer,
+  OUT UINTN          *OutLength,
+  OUT BOOLEAN        *SkipDirent
+  )
+{
+  EFI_STATUS  Status;
+  EXT4_FILE   *TempFile;
+  CHAR16      DirentUcs2Name[EXT4_NAME_MAX + 1];
+
+  *SkipDirent = FALSE;
+  // Test if the dirent is valid utf-8. This is already done inside Ext4OpenDirent but EFI_INVALID_PARAMETER
+  // has the danger of its meaning being overloaded in many places, so we can't skip according to that.
+  // So test outside of it, explicitly.
+  Status = Ext4GetUcs2DirentName (Entry, DirentUcs2Name);
+
+  if (EFI_ERROR (Status)) {
+    if (Status == EFI_INVALID_PARAMETER) {
+      // Bad UTF-8, skip.
+      *SkipDirent = TRUE;
+      return Status;
+    }
+
+    return Status;
+  }
+
+  Status = Ext4OpenDirent (Partition, EFI_FILE_MODE_READ, &TempFile, Entry, Directory);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = Ext4GetFileInfo (TempFile, Buffer, OutLength);
+  Ext4CloseInternal (TempFile);
+  return Status;
+}
+
+/**
    Reads a directory entry.
 
    @param[in]      Partition   Pointer to the ext4 partition.
@@ -457,118 +545,62 @@ Ext4ReadDir (
   IN OUT UINTN       *OutLength
   )
 {
-  EXT4_INODE      *DirIno;
   EFI_STATUS      Status;
-  UINT64          DirInoSize;
   UINTN           Len;
   UINT32          BlockRemainder;
   EXT4_DIR_ENTRY  Entry;
-  EXT4_FILE       *TempFile;
-  BOOLEAN         ShouldSkip;
-  BOOLEAN         IsDotOrDotDot;
-  CHAR16          DirentUcs2Name[EXT4_NAME_MAX + 1];
+  BOOLEAN         KeepGoing;
 
-  DirIno     = File->Inode;
-  Status     = EFI_SUCCESS;
-  DirInoSize = EXT4_INODE_SIZE (DirIno);
+  Status    = EFI_SUCCESS;
+  KeepGoing = TRUE;
 
-  DivU64x32Remainder (DirInoSize, Partition->BlockSize, &BlockRemainder);
+  DivU64x32Remainder (EXT4_INODE_SIZE (File->Inode), Partition->BlockSize, &BlockRemainder);
   if (BlockRemainder != 0) {
     // Directory inodes need to have block aligned sizes
     return EFI_VOLUME_CORRUPTED;
   }
 
-  while (TRUE) {
-    TempFile = NULL;
-
+  while (KeepGoing) {
     // We (try to) read the maximum size of a directory entry at a time
     // Note that we don't need to read any padding that may exist after it.
     Len    = sizeof (Entry);
     Status = Ext4Read (Partition, File, &Entry, Offset, &Len);
 
     if (EFI_ERROR (Status)) {
-      goto Out;
+      return Status;
     }
 
     if (Len == 0) {
+      // End of directory
       *OutLength = 0;
-      Status     = EFI_SUCCESS;
-      goto Out;
+      return EFI_SUCCESS;
     }
 
     if (Len < EXT4_MIN_DIR_ENTRY_LEN) {
-      Status = EFI_VOLUME_CORRUPTED;
-      goto Out;
+      return EFI_VOLUME_CORRUPTED;
     }
 
     // Invalid directory entry length
     if (!Ext4ValidDirent (&Entry)) {
       DEBUG ((DEBUG_ERROR, "[ext4] Invalid dirent at offset %lu\n", Offset));
-      Status = EFI_VOLUME_CORRUPTED;
-      goto Out;
+      return EFI_VOLUME_CORRUPTED;
     }
 
     // Check if the entire dir entry length fits in Len
     if (Len < (UINTN)(EXT4_MIN_DIR_ENTRY_LEN + Entry.name_len)) {
-      Status = EFI_VOLUME_CORRUPTED;
-      goto Out;
+      return EFI_VOLUME_CORRUPTED;
     }
 
-    // We don't care about passing . or .. entries to the caller of ReadDir(),
-    // since they're generally useless entries *and* may break things if too
-    // many callers assume FAT32.
-
-    // Entry.name_len may be 0 if it's a nameless entry, like an unused entry
-    // or a checksum at the end of the directory block.
-    // memcmp (and CompareMem) return 0 when the passed length is 0.
-
-    // We must bound name_len as > 0 and <= 2 to avoid any out-of-bounds accesses or bad detection of
-    // "." and "..".
-    IsDotOrDotDot = Entry.name_len > 0 && Entry.name_len <= 2 &&
-                    CompareMem (Entry.name, "..", Entry.name_len) == 0;
-
-    // When inode = 0, it's unused. When name_len == 0, it's a nameless entry
-    // (which we should not expose to ReadDir).
-    ShouldSkip = Entry.inode == 0 || Entry.name_len == 0 || IsDotOrDotDot;
-
-    if (ShouldSkip) {
+    if (Ext4ShouldSkipOnReadDir (&Entry)) {
       Offset += Entry.rec_len;
       continue;
     }
 
-    // Test if the dirent is valid utf-8. This is already done inside Ext4OpenDirent but EFI_INVALID_PARAMETER
-    // has the danger of its meaning being overloaded in many places, so we can't skip according to that.
-    // So test outside of it, explicitly.
-    Status = Ext4GetUcs2DirentName (&Entry, DirentUcs2Name);
-
-    if (EFI_ERROR (Status)) {
-      if (Status == EFI_INVALID_PARAMETER) {
-        // Bad UTF-8, skip.
-        Offset += Entry.rec_len;
-        continue;
-      }
-
-      goto Out;
-    }
-
-    Status = Ext4OpenDirent (Partition, EFI_FILE_MODE_READ, &TempFile, &Entry, File);
-
-    if (EFI_ERROR (Status)) {
-      goto Out;
-    }
-
-    Status = Ext4GetFileInfo (TempFile, Buffer, OutLength);
-    if (!EFI_ERROR (Status)) {
-      File->Position = Offset + Entry.rec_len;
-    }
-
-    Ext4CloseInternal (TempFile);
-
-    goto Out;
+    Status  = Ext4StatDirent (Partition, &Entry, File, Buffer, OutLength, &KeepGoing);
+    Offset += Entry.rec_len;
   }
 
-  Status = EFI_SUCCESS;
-Out:
+  File->Position = Offset;
   return Status;
 }
 
