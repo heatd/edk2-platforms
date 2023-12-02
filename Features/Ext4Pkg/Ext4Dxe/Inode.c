@@ -1,7 +1,7 @@
 /** @file
   Inode related routines
 
-  Copyright (c) 2021 - 2022 Pedro Falcato All rights reserved.
+  Copyright (c) 2021 - 2023 Pedro Falcato All rights reserved.
   SPDX-License-Identifier: BSD-2-Clause-Patent
 
   EpochToEfiTime copied from EmbeddedPkg/Library/TimeBaseLib.c
@@ -70,6 +70,66 @@ Ext4CalculateInodeChecksum (
 }
 
 /**
+   Reads from an extent.
+   @param[in]      Partition     Pointer to the opened EXT4 partition.
+   @param[in]      Extent        Pointer to the extent.
+   @param[out]     Buffer        Pointer to the buffer.
+   @param[in]      RemainingRead Amount of bytes we may read.
+   @param[in]      CurrentSeek   Inode offset of the read.
+   @param[out]     WasRead       After a successful read, it's updated to the number of read bytes.
+
+   @return Status of the read operation.
+**/
+STATIC
+EFI_STATUS
+Ext4ReadExtent (
+  IN EXT4_PARTITION     *Partition,
+  IN CONST EXT4_EXTENT  *Extent,
+  OUT VOID              *Buffer,
+  IN UINTN              RemainingRead,
+  IN UINT64             CurrentSeek,
+  OUT UINTN             *WasRead
+  )
+{
+  UINT64      ExtentStartBytes;
+  UINT64      ExtentLengthBytes;
+  UINT64      ExtentLogicalBytes;
+  UINTN       ToRead;
+  EFI_STATUS  Status;
+
+  // Our extent offset is the difference between CurrentSeek and ExtentLogicalBytes
+  UINT64  ExtentOffset;
+  UINTN   ExtentMayRead;
+
+  ExtentStartBytes = MultU64x32 (
+                       LShiftU64 (Extent->ee_start_hi, 32) |
+                       Extent->ee_start_lo,
+                       Partition->BlockSize
+                       );
+  ExtentLengthBytes  = Extent->ee_len * Partition->BlockSize;
+  ExtentLogicalBytes = MultU64x32 ((UINT64)Extent->ee_block, Partition->BlockSize);
+  ExtentOffset       = CurrentSeek - ExtentLogicalBytes;
+  ExtentMayRead      = (UINTN)(ExtentLengthBytes - ExtentOffset);
+  ToRead             = ExtentMayRead > RemainingRead ? RemainingRead : ExtentMayRead;
+
+  Status = Ext4ReadDiskIo (Partition, Buffer, ToRead, ExtentStartBytes + ExtentOffset);
+
+  if (EFI_ERROR (Status)) {
+    DEBUG ((
+      DEBUG_ERROR,
+      "[ext4] Error %r reading [%lu, %lu]\n",
+      Status,
+      ExtentStartBytes + ExtentOffset,
+      ExtentStartBytes + ExtentOffset + WasRead - 1
+      ));
+  } else {
+    *WasRead = ToRead;
+  }
+
+  return Status;
+}
+
+/**
    Reads from an EXT4 inode.
    @param[in]      Partition     Pointer to the opened EXT4 partition.
    @param[in]      File          Pointer to the opened file.
@@ -89,7 +149,6 @@ Ext4Read (
   IN OUT UINTN           *Length
   )
 {
-  EXT4_INODE   *Inode;
   UINT64       InodeSize;
   UINT64       CurrentSeek;
   UINTN        RemainingRead;
@@ -101,16 +160,8 @@ Ext4Read (
   BOOLEAN      HasBackingExtent;
   UINT32       HoleOff;
   UINT64       HoleLen;
-  UINT64       ExtentStartBytes;
-  UINT64       ExtentLengthBytes;
-  UINT64       ExtentLogicalBytes;
 
-  // Our extent offset is the difference between CurrentSeek and ExtentLogicalBytes
-  UINT64  ExtentOffset;
-  UINTN   ExtentMayRead;
-
-  Inode         = File->Inode;
-  InodeSize     = EXT4_INODE_SIZE (Inode);
+  InodeSize     = EXT4_INODE_SIZE (File->Inode);
   CurrentSeek   = Offset;
   RemainingRead = *Length;
   BeenRead      = 0;
@@ -160,28 +211,8 @@ Ext4Read (
       // size and memset all that
       ZeroMem (Buffer, WasRead);
     } else {
-      ExtentStartBytes = MultU64x32 (
-                           LShiftU64 (Extent.ee_start_hi, 32) |
-                           Extent.ee_start_lo,
-                           Partition->BlockSize
-                           );
-      ExtentLengthBytes  = Extent.ee_len * Partition->BlockSize;
-      ExtentLogicalBytes = MultU64x32 ((UINT64)Extent.ee_block, Partition->BlockSize);
-      ExtentOffset       = CurrentSeek - ExtentLogicalBytes;
-      ExtentMayRead      = (UINTN)(ExtentLengthBytes - ExtentOffset);
-
-      WasRead = ExtentMayRead > RemainingRead ? RemainingRead : ExtentMayRead;
-
-      Status = Ext4ReadDiskIo (Partition, Buffer, WasRead, ExtentStartBytes + ExtentOffset);
-
+      Status = Ext4ReadExtent (Partition, &Extent, Buffer, RemainingRead, CurrentSeek, &WasRead);
       if (EFI_ERROR (Status)) {
-        DEBUG ((
-          DEBUG_ERROR,
-          "[ext4] Error %r reading [%lu, %lu]\n",
-          Status,
-          ExtentStartBytes + ExtentOffset,
-          ExtentStartBytes + ExtentOffset + WasRead - 1
-          ));
         return Status;
       }
     }
