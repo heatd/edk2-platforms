@@ -90,10 +90,89 @@ Ext4ValidDirent (
 }
 
 /**
+   Retrieves a directory entry from a given directory block.
+
+   @param[in]      Name        Pointer to the UCS-2 formatted filename.
+   @param[in]      Partition   Pointer to the ext4 partition.
+   @param[in]      Buf         Pointer to the block's data
+   @param[out]     Result      Pointer to the destination directory entry.
+
+   @return The result of the operation.
+**/
+STATIC
+EFI_STATUS
+Ext4FindDirentInBlock (
+  IN CONST CHAR16     *Name,
+  IN EXT4_PARTITION   *Partition,
+  IN CONST VOID       *Buf,
+  OUT EXT4_DIR_ENTRY  *Result
+  )
+{
+  EXT4_DIR_ENTRY  *Entry;
+  UINT32          BlockOffset;
+  UINT32          RemainingBlock;
+  CHAR16          DirentUcs2Name[EXT4_NAME_MAX + 1];
+  UINTN           ToCopy;
+  EFI_STATUS      Status;
+
+  for (BlockOffset = 0; BlockOffset < Partition->BlockSize; BlockOffset += Entry->rec_len) {
+    Entry          = (EXT4_DIR_ENTRY *)(Buf + BlockOffset);
+    RemainingBlock = Partition->BlockSize - BlockOffset;
+    // Check if the minimum directory entry fits inside [BlockOffset, EndOfBlock]
+    if (RemainingBlock < EXT4_MIN_DIR_ENTRY_LEN) {
+      return EFI_VOLUME_CORRUPTED;
+    }
+
+    if (!Ext4ValidDirent (Entry)) {
+      return EFI_VOLUME_CORRUPTED;
+    }
+
+    if ((Entry->name_len > RemainingBlock) || (Entry->rec_len > RemainingBlock)) {
+      // Corrupted filesystem
+      return EFI_VOLUME_CORRUPTED;
+    }
+
+    // Unused entry
+    if (Entry->inode == 0) {
+      continue;
+    }
+
+    Status = Ext4GetUcs2DirentName (Entry, DirentUcs2Name);
+
+    /* In theory, this should never fail.
+     * In reality, it's quite possible that it can fail, considering filenames in
+     * Linux (and probably other nixes) are just null-terminated bags of bytes, and don't
+     * need to form valid ASCII/UTF-8 sequences.
+     */
+    if (EFI_ERROR (Status)) {
+      if (Status == EFI_INVALID_PARAMETER) {
+        // If we error out due to a bad UTF-8 sequence (see Ext4GetUcs2DirentName), skip this entry.
+        // I'm not sure if this is correct behaviour, but I don't think there's a precedent here.
+        continue;
+      }
+
+      // Other sorts of errors should just error out.
+      return Status;
+    }
+
+    if ((Entry->name_len == StrLen (Name)) &&
+        !Ext4StrCmpInsensitive (DirentUcs2Name, (CHAR16 *)Name))
+    {
+      ToCopy = MIN (Entry->rec_len, sizeof (EXT4_DIR_ENTRY));
+
+      CopyMem (Result, Entry, ToCopy);
+      return EFI_SUCCESS;
+    }
+  }
+
+  return EFI_NOT_FOUND;
+}
+
+/**
    Retrieves a directory entry.
 
    @param[in]      Directory   Pointer to the opened directory.
-   @param[in]      NameUnicode Pointer to the UCS-2 formatted filename.
+   @param[in]      Name        Pointer to the UCS-2 formatted filename.
    @param[in]      Partition   Pointer to the ext4 partition.
    @param[out]     Result      Pointer to the destination directory entry.
 
@@ -107,109 +186,39 @@ Ext4RetrieveDirent (
   OUT EXT4_DIR_ENTRY  *Result
   )
 {
-  EFI_STATUS      Status;
-  CHAR8           *Buf;
-  UINT64          Off;
-  EXT4_INODE      *Inode;
-  UINT64          DirInoSize;
-  UINT32          BlockRemainder;
-  UINTN           Length;
-  EXT4_DIR_ENTRY  *Entry;
-  UINTN           RemainingBlock;
-  CHAR16          DirentUcs2Name[EXT4_NAME_MAX + 1];
-  UINTN           ToCopy;
-  UINTN           BlockOffset;
+  EFI_STATUS  Status;
+  CHAR8       *Buf;
+  UINT64      Block;
+  UINT32      BlockRemainder;
+  UINTN       Length;
+  UINT64      NrBlocks;
 
   Buf = AllocatePool (Partition->BlockSize);
-
   if (Buf == NULL) {
     return EFI_OUT_OF_RESOURCES;
   }
 
-  Off = 0;
-
-  Inode      = Directory->Inode;
-  DirInoSize = EXT4_INODE_SIZE (Inode);
-
-  DivU64x32Remainder (DirInoSize, Partition->BlockSize, &BlockRemainder);
+  NrBlocks = DivU64x32Remainder (EXT4_INODE_SIZE (Directory->Inode), Partition->BlockSize, &BlockRemainder);
   if (BlockRemainder != 0) {
     // Directory inodes need to have block aligned sizes
     Status = EFI_VOLUME_CORRUPTED;
     goto Out;
   }
 
-  while (Off < DirInoSize) {
+  for (Block = 0; Block < NrBlocks; Block++) {
     Length = Partition->BlockSize;
 
-    Status = Ext4Read (Partition, Directory, Buf, Off, &Length);
-
+    Status = Ext4Read (Partition, Directory, Buf, EXT4_BLOCK_TO_BYTES (Partition, Block), &Length);
     if (Status != EFI_SUCCESS) {
       goto Out;
     }
 
-    for (BlockOffset = 0; BlockOffset < Partition->BlockSize; ) {
-      Entry          = (EXT4_DIR_ENTRY *)(Buf + BlockOffset);
-      RemainingBlock = Partition->BlockSize - BlockOffset;
-      // Check if the minimum directory entry fits inside [BlockOffset, EndOfBlock]
-      if (RemainingBlock < EXT4_MIN_DIR_ENTRY_LEN) {
-        Status = EFI_VOLUME_CORRUPTED;
-        goto Out;
-      }
-
-      if (!Ext4ValidDirent (Entry)) {
-        Status = EFI_VOLUME_CORRUPTED;
-        goto Out;
-      }
-
-      if ((Entry->name_len > RemainingBlock) || (Entry->rec_len > RemainingBlock)) {
-        // Corrupted filesystem
-        Status = EFI_VOLUME_CORRUPTED;
-        goto Out;
-      }
-
-      // Unused entry
-      if (Entry->inode == 0) {
-        BlockOffset += Entry->rec_len;
-        continue;
-      }
-
-      Status = Ext4GetUcs2DirentName (Entry, DirentUcs2Name);
-
-      /* In theory, this should never fail.
-       * In reality, it's quite possible that it can fail, considering filenames in
-       * Linux (and probably other nixes) are just null-terminated bags of bytes, and don't
-       * need to form valid ASCII/UTF-8 sequences.
-       */
-      if (EFI_ERROR (Status)) {
-        if (Status == EFI_INVALID_PARAMETER) {
-          // If we error out due to a bad UTF-8 sequence (see Ext4GetUcs2DirentName), skip this entry.
-          // I'm not sure if this is correct behaviour, but I don't think there's a precedent here.
-          BlockOffset += Entry->rec_len;
-          continue;
-        }
-
-        // Other sorts of errors should just error out.
-        FreePool (Buf);
-        return Status;
-      }
-
-      if ((Entry->name_len == StrLen (Name)) &&
-          !Ext4StrCmpInsensitive (DirentUcs2Name, (CHAR16 *)Name))
-      {
-        ToCopy = MIN (Entry->rec_len, sizeof (EXT4_DIR_ENTRY));
-
-        CopyMem (Result, Entry, ToCopy);
-        Status = EFI_SUCCESS;
-        goto Out;
-      }
-
-      BlockOffset += Entry->rec_len;
+    Status = Ext4FindDirentInBlock (Name, Partition, Buf, Result);
+    if (Status != EFI_NOT_FOUND) {
+      // Get out of the loop if we either error out, or get an error
+      goto Out;
     }
-
-    Off += Partition->BlockSize;
   }
-
-  Status = EFI_NOT_FOUND;
 
 Out:
   FreePool (Buf);
