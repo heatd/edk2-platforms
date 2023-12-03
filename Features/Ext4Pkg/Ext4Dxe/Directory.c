@@ -89,12 +89,48 @@ Ext4ValidDirent (
   return TRUE;
 }
 
+STATIC
+EFI_STATUS
+Ext4GetBufferForInode (
+  IN EXT4_PARTITION   *Partition,
+  IN EXT4_FILE        *Directory,
+  IN UINT64           Off,
+  IN OUT EXT4_BUFFER  **Buffer
+  )
+{
+  EFI_STATUS     Status;
+  EXT4_EXTENT    Extent;
+  EXT4_BLOCK_NR  BlockNr;
+  EXT4_BLOCK_NR  PhysicalBlock;
+
+  BlockNr = Off / Partition->BlockSize;
+
+  Status = Ext4GetExtent (Partition, Directory, BlockNr /* FIX FOR 32-bit*/, &Extent);
+  if ((Status != EFI_SUCCESS) && (Status != EFI_NO_MAPPING)) {
+    return Status;
+  }
+
+  if ((Status == EFI_NO_MAPPING) || EXT4_EXTENT_IS_UNINITIALIZED (&Extent)) {
+    return EFI_NO_MAPPING;
+  }
+
+  PhysicalBlock = (LShiftU64 (Extent.ee_start_hi, 32) |
+                   Extent.ee_start_lo) + (BlockNr - Extent.ee_block);
+
+  if (*Buffer != NULL) {
+    Ext4PutBuffer (Partition, *Buffer);
+    *Buffer = NULL;
+  }
+
+  return Ext4FindBuffer (Partition, PhysicalBlock, Buffer);
+}
+
 /**
    Retrieves a directory entry from a given directory block.
 
    @param[in]      Name        Pointer to the UCS-2 formatted filename.
    @param[in]      Partition   Pointer to the ext4 partition.
-   @param[in]      Buf         Pointer to the block's data
+   @param[in]      Buf         Pointer to the block's buffer object
    @param[out]     Result      Pointer to the destination directory entry.
 
    @return The result of the operation.
@@ -104,7 +140,7 @@ EFI_STATUS
 Ext4FindDirentInBlock (
   IN CONST CHAR16     *Name,
   IN EXT4_PARTITION   *Partition,
-  IN CONST VOID       *Buf,
+  IN EXT4_BUFFER      *Buffer,
   OUT EXT4_DIR_ENTRY  *Result
   )
 {
@@ -114,6 +150,9 @@ Ext4FindDirentInBlock (
   CHAR16          DirentUcs2Name[EXT4_NAME_MAX + 1];
   UINTN           ToCopy;
   EFI_STATUS      Status;
+  VOID            *Buf;
+
+  Buf = Buffer->Buffer;
 
   for (BlockOffset = 0; BlockOffset < Partition->BlockSize; BlockOffset += Entry->rec_len) {
     Entry          = (EXT4_DIR_ENTRY *)(Buf + BlockOffset);
@@ -186,17 +225,13 @@ Ext4RetrieveDirent (
   OUT EXT4_DIR_ENTRY  *Result
   )
 {
-  EFI_STATUS  Status;
-  CHAR8       *Buf;
-  UINT64      Block;
-  UINT32      BlockRemainder;
-  UINTN       Length;
-  UINT64      NrBlocks;
+  EFI_STATUS   Status;
+  EXT4_BUFFER  *Buffer;
+  UINT64       Block;
+  UINT32       BlockRemainder;
+  UINT64       NrBlocks;
 
-  Buf = AllocatePool (Partition->BlockSize);
-  if (Buf == NULL) {
-    return EFI_OUT_OF_RESOURCES;
-  }
+  Buffer = NULL;
 
   NrBlocks = DivU64x32Remainder (EXT4_INODE_SIZE (Directory->Inode), Partition->BlockSize, &BlockRemainder);
   if (BlockRemainder != 0) {
@@ -206,14 +241,17 @@ Ext4RetrieveDirent (
   }
 
   for (Block = 0; Block < NrBlocks; Block++) {
-    Length = Partition->BlockSize;
-
-    Status = Ext4Read (Partition, Directory, Buf, EXT4_BLOCK_TO_BYTES (Partition, Block), &Length);
+    Status = Ext4GetBufferForInode (Partition, Directory, EXT4_BLOCK_TO_BYTES (Partition, Block), &Buffer);
     if (Status != EFI_SUCCESS) {
+      if (Status == EFI_NO_MAPPING) {
+        // Can directories have holes? Maybe? Just ignore this block
+        continue;
+      }
+
       goto Out;
     }
 
-    Status = Ext4FindDirentInBlock (Name, Partition, Buf, Result);
+    Status = Ext4FindDirentInBlock (Name, Partition, Buffer, Result);
     if (Status != EFI_NOT_FOUND) {
       // Get out of the loop if we either error out, or get an error
       goto Out;
@@ -221,7 +259,10 @@ Ext4RetrieveDirent (
   }
 
 Out:
-  FreePool (Buf);
+  if (Buffer) {
+    Ext4PutBuffer (Partition, Buffer);
+  }
+
   return Status;
 }
 
@@ -580,8 +621,21 @@ Ext4ReadDir (
       return EFI_VOLUME_CORRUPTED;
     }
 
+    Status = Ext4GetBufferForInode (Partition, File, Offset, &Buf);
+    if (EFI_ERROR (Status)) {
+      if (Status == EFI_NO_MAPPING) {
+        // Can directories have holes? Maybe? Just ignore this block
+        Offset += Partition->BlockSize;
+        continue;
+      }
+
+      goto Out;
+    }
+
+    Entry = (VOID *)(((UINT8 *)Buf->Buffer) + BlockOffset);
+
     // Invalid directory entry length
-    if (!Ext4ValidDirent (&Entry)) {
+    if (!Ext4ValidDirent (Entry)) {
       DEBUG ((DEBUG_ERROR, "[ext4] Invalid dirent at offset %lu\n", Offset));
       return EFI_VOLUME_CORRUPTED;
     }

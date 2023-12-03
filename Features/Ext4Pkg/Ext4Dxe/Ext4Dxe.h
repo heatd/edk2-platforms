@@ -77,6 +77,22 @@ Ext4OpenPartition (
 typedef struct _Ext4File     EXT4_FILE;
 typedef struct _Ext4_Dentry  EXT4_DENTRY;
 
+#define EXT4_BLOCK_CACHE_SIZE  128
+
+typedef struct _Ext4_BlockCache {
+  LIST_ENTRY            LruList;
+  ORDERED_COLLECTION    *BlockCache;
+  INT32                 NrLruBlocks;
+  INT32                 NrCachedBlocks;
+} EXT4_BLOCKCACHE;
+
+typedef struct _Ext4_Buffer {
+  VOID             *Buffer;
+  EXT4_BLOCK_NR    BlockNr;
+  INT32            Refcount;
+  LIST_ENTRY       LruList;
+} EXT4_BUFFER;
+
 typedef struct _Ext4_PARTITION {
   EFI_SIMPLE_FILE_SYSTEM_PROTOCOL    Interface;
   EFI_DISK_IO_PROTOCOL               *DiskIo;
@@ -104,6 +120,7 @@ typedef struct _Ext4_PARTITION {
   LIST_ENTRY                         OpenFiles;
 
   EXT4_DENTRY                        *RootDentry;
+  EXT4_BLOCKCACHE                    BlockCache;
 } EXT4_PARTITION;
 
 /**
@@ -1031,6 +1048,19 @@ Ext4InitExtentsMap (
   );
 
 /**
+   Initialises the (empty) LRU block cache
+
+   @param[in]      Partition        Pointer to the open partition.
+
+   @return Result of the operation.
+**/
+
+EFI_STATUS
+Ext4InitBlockCache (
+  IN EXT4_PARTITION  *Partition
+  );
+
+/**
    Frees the extents map, deleting every extent stored.
 
    @param[in]      File        Pointer to the open file.
@@ -1250,6 +1280,24 @@ Ext4GetBlocks (
   IN  EXT4_FILE       *File,
   IN  EXT2_BLOCK_NR   LogicalBlock,
   OUT EXT4_EXTENT     *Extent
+  );
+
+VOID
+Ext4GetBuffer (
+  IN EXT4_BUFFER  *Buffer
+  );
+
+VOID
+Ext4PutBuffer (
+  IN EXT4_PARTITION  *Partition,
+  IN EXT4_BUFFER     *Buffer
+  );
+
+EFI_STATUS
+Ext4FindBuffer (
+  IN EXT4_PARTITION  *Partition,
+  IN EXT4_BLOCK_NR   BlockNr,
+  OUT EXT4_BUFFER    **Buffer
   );
 
 #endif

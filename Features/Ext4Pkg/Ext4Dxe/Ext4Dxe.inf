@@ -130,6 +130,7 @@
   PcdLib
   OrderedCollectionLib
   BaseUcs2Utf8Lib
+  TimerLib
 
 [Guids]
   gEfiFileInfoGuid                      ## SOMETIMES_CONSUMES   ## UNDEFINED

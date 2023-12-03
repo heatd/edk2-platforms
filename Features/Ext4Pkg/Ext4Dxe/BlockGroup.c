@@ -48,7 +48,10 @@ Ext4ReadInode (
   EXT4_INODE             *Inode;
   EXT4_BLOCK_GROUP_DESC  *BlockGroup;
   EXT4_BLOCK_NR          InodeTableStart;
+  EXT4_BLOCK_NR          InodeTableOffset;
+  UINT64                 TableBlockOffset;
   EFI_STATUS             Status;
+  EXT4_BUFFER            *Buffer;
 
   if (!EXT4_IS_VALID_INODE_NR (Partition, InodeNum)) {
     DEBUG ((DEBUG_ERROR, "[ext4] Error reading inode: inode number %lu isn't valid\n", InodeNum));
@@ -66,6 +69,12 @@ Ext4ReadInode (
     return EFI_VOLUME_CORRUPTED;
   }
 
+  InodeTableOffset = DivU64x64Remainder (
+                       MultU64x32 (InodeOffset, Partition->InodeSize),
+                       Partition->BlockSize,
+                       &TableBlockOffset
+                       );
+
   Inode = Ext4AllocateInode (Partition);
 
   if (Inode == NULL) {
@@ -82,12 +91,7 @@ Ext4ReadInode (
                       BlockGroup->bg_inode_table_hi
                       );
 
-  Status = Ext4ReadDiskIo (
-             Partition,
-             Inode,
-             Partition->InodeSize,
-             EXT4_BLOCK_TO_BYTES (Partition, InodeTableStart) + MultU64x32 (InodeOffset, Partition->InodeSize)
-             );
+  Status = Ext4FindBuffer (Partition, InodeTableStart + InodeTableOffset, &Buffer);
 
   if (EFI_ERROR (Status)) {
     DEBUG ((
@@ -102,6 +106,10 @@ Ext4ReadInode (
     FreePool (Inode);
     return Status;
   }
+
+  CopyMem (Inode, ((UINT8 *)Buffer->Buffer) + TableBlockOffset, Partition->InodeSize);
+
+  Ext4PutBuffer (Partition, Buffer);
 
   if (!Ext4CheckInodeChecksum (Partition, Inode, InodeNum)) {
     DEBUG ((

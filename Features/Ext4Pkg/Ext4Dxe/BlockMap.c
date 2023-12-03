@@ -1,7 +1,7 @@
 /** @file
   Implementation of routines that deal with ext2/3 block maps.
 
-  Copyright (c) 2022 Pedro Falcato All rights reserved.
+  Copyright (c) 2022 - 2023 Pedro Falcato All rights reserved.
   SPDX-License-Identifier: BSD-2-Clause-Patent
 **/
 
@@ -221,10 +221,11 @@ Ext4GetBlocks (
   EXT2_BLOCK_NR  BlockPath[EXT4_MAX_BLOCK_PATH];
   UINTN          BlockPathLength;
   UINTN          Index;
-  UINT32         *Buffer;
+  UINT32         *Bmap;
   EFI_STATUS     Status;
   UINT32         Block;
   UINT32         BlockIndex;
+  EXT4_BUFFER    *Buffer;
 
   Inode = File->Inode;
 
@@ -244,10 +245,8 @@ Ext4GetBlocks (
     return EFI_SUCCESS;
   }
 
-  Buffer = AllocatePool (Partition->BlockSize);
-  if (Buffer == NULL) {
-    return EFI_OUT_OF_RESOURCES;
-  }
+  Buffer = NULL;
+  Bmap   = NULL;
 
   // Note the BlockPathLength - 1 so we don't end up reading the final block
   for (Index = 0; Index < BlockPathLength - 1; Index++) {
@@ -256,30 +255,35 @@ Ext4GetBlocks (
     if (Index == 0) {
       Block = Inode->i_data[BlockIndex];
     } else {
-      Block = Buffer[BlockIndex];
+      Block = Bmap[BlockIndex];
+    }
+
+    if (Buffer != NULL) {
+      Ext4PutBuffer (Partition, Buffer);
+      Buffer = NULL;
     }
 
     if (Block == EXT4_BLOCK_FILE_HOLE) {
-      FreePool (Buffer);
       return EFI_NO_MAPPING;
     }
 
-    Status = Ext4ReadBlocks (Partition, Buffer, 1, Block);
+    Status = Ext4FindBuffer (Partition, Block, &Buffer);
 
     if (EFI_ERROR (Status)) {
-      FreePool (Buffer);
       return Status;
     }
+
+    Bmap = Buffer->Buffer;
   }
 
   Ext4GetExtentInBlockMap (
-    Buffer,
+    Bmap,
     Partition->BlockSize / sizeof (UINT32),
     BlockPath[BlockPathLength - 1],
     Extent
     );
 
-  FreePool (Buffer);
+  Ext4PutBuffer (Partition, Buffer);
 
   return EFI_SUCCESS;
 }

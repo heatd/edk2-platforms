@@ -320,6 +320,9 @@ Ext4OpenSuperblock (
     return EFI_OUT_OF_RESOURCES;
   }
 
+  // XXX TOFIX
+  ASSERT_EFI_ERROR (Ext4InitBlockCache (Partition));
+
   // Note that the cast below is completely safe, because EXT4_FILE is a specialization of EFI_FILE_PROTOCOL
   Status = Ext4OpenVolume (&Partition->Interface, (EFI_FILE_PROTOCOL **)&Partition->Root);
 
